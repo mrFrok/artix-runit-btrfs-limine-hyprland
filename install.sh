@@ -671,16 +671,41 @@ DisplayServer=x11
 Numlock=on
 EOF
 
-# User Hyprland config: stock config + NVIDIA env + pipewire + us/ru layout
+# User Hyprland config: stock config + NVIDIA env + pipewire + us/ru layout.
+# Hyprland >= 0.55 uses Lua (hyprland.lua), older versions use hyprlang (hyprland.conf).
 HYPR_DIR="/home/$USERNAME/.config/hypr"
 mkdir -p "$HYPR_DIR"
-if [[ -f /usr/share/hypr/hyprland.conf && ! -f "$HYPR_DIR/hyprland.conf" ]]; then
-	cp /usr/share/hypr/hyprland.conf "$HYPR_DIR/hyprland.conf"
-	if command -v artix-pipewire-launcher &>/dev/null; then
-		pw_line="exec-once = artix-pipewire-launcher"
-	else
-		pw_line=$'exec-once = /usr/bin/pipewire\nexec-once = /usr/bin/pipewire-pulse\nexec-once = /usr/bin/wireplumber'
+PW_CMD="sh -c 'pipewire & sleep 1; wireplumber & pipewire-pulse'"
+if [[ -f /usr/share/hypr/hyprland.lua ]]; then
+	[[ -f "$HYPR_DIR/hyprland.lua" ]] || cp /usr/share/hypr/hyprland.lua "$HYPR_DIR/hyprland.lua"
+	if ! grep -q 'added by artix installer' "$HYPR_DIR/hyprland.lua"; then
+		cat >>"$HYPR_DIR/hyprland.lua" <<EOF
+
+---------------- added by artix installer ----------------
+-- NVIDIA
+hl.env("LIBVA_DRIVER_NAME", "nvidia")
+hl.env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+hl.env("NVD_BACKEND", "direct")
+hl.env("ELECTRON_OZONE_PLATFORM_HINT", "auto")
+
+-- Audio (no systemd user services on runit), polkit agent, bar
+hl.on("hyprland.start", function()
+    hl.exec_cmd("$PW_CMD")
+    hl.exec_cmd("/usr/lib/hyprpolkitagent/hyprpolkitagent")
+    hl.exec_cmd("waybar")
+end)
+
+-- Keyboard layouts: Alt+Shift to switch
+hl.config({
+    input = {
+        kb_layout  = "us,ru",
+        kb_options = "grp:alt_shift_toggle",
+    },
+})
+EOF
 	fi
+elif [[ -f /usr/share/hypr/hyprland.conf && ! -f "$HYPR_DIR/hyprland.conf" ]]; then
+	cp /usr/share/hypr/hyprland.conf "$HYPR_DIR/hyprland.conf"
 	cat >>"$HYPR_DIR/hyprland.conf" <<EOF
 
 # ---------------- added by artix installer ----------------
@@ -690,10 +715,8 @@ env = __GLX_VENDOR_LIBRARY_NAME,nvidia
 env = NVD_BACKEND,direct
 env = ELECTRON_OZONE_PLATFORM_HINT,auto
 
-# Audio (no systemd user services on runit)
-$pw_line
-
-# Polkit agent, bar
+# Audio (no systemd user services on runit), polkit agent, bar
+exec-once = $PW_CMD
 exec-once = /usr/lib/hyprpolkitagent/hyprpolkitagent
 exec-once = waybar
 
