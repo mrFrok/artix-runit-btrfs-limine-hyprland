@@ -80,6 +80,11 @@ source /tmp/rank-mirrors.sh
 ((EUID == 0)) || die "Run as root."
 [[ -d /sys/firmware/efi/efivars ]] || die "Not booted in UEFI mode."
 command -v basestrap >/dev/null || die "basestrap not found — is this the Artix live ISO?"
+# Old ISOs have a stale keyring/glibc: installing current packages into them breaks tools
+pacman_ver=$(pacman -Q pacman | awk '{print $2}')
+if (($(vercmp "$pacman_ver" 6.1) < 0)); then
+	die "This live ISO is too old (pacman $pacman_ver). Download the latest base-runit ISO from https://artixlinux.org/download.php"
+fi
 
 info "Checking network..."
 net_ok() { # ICMP may be filtered, so also try plain HTTP to an IP
@@ -146,6 +151,13 @@ if ((${#missing[@]})); then
 	pacman -S --noconfirm --needed "${missing[@]}" ||
 		die "Could not install: ${missing[*]}"
 fi
+# Make sure every tool actually runs before anything destructive happens
+for t in sgdisk mkfs.btrfs mkfs.fat wipefs pacman; do
+	out=$("$t" --version 2>&1 || true)
+	if grep -qE 'not found \(required by|error while loading shared libraries' <<<"$out"; then
+		die "'$t' is broken in this live environment (library mismatch). Use the latest ISO."
+	fi
+done
 
 # ----------------------------------------------------------------------------
 # Find existing Windows boot loaders (any ESP on any disk)
