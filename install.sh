@@ -110,6 +110,17 @@ if ! getent hosts artixlinux.org &>/dev/null; then
 	getent hosts artixlinux.org &>/dev/null || die "DNS still does not work."
 fi
 
+# Known-good mirrors as extra candidates, in case the ISO's mirrorlist is outdated
+if ! grep -q 'installer fallback' /etc/pacman.d/mirrorlist; then
+	cat >>/etc/pacman.d/mirrorlist <<'EOF'
+# installer fallback candidates
+#Server = https://mirror1.artixlinux.org/repos/$repo/os/$arch
+#Server = https://mirrors.dotsrc.org/artix-linux/repos/$repo/os/$arch
+#Server = https://mirror.netcologne.de/artix-linux/$repo/os/$arch
+#Server = https://mirror.clarkson.edu/artix-linux/repos/$repo/os/$arch
+#Server = https://ftp.sh.cvut.cz/artix-linux/$repo/os/$arch
+EOF
+fi
 info "Ranking Artix mirrors (this takes a few seconds)..."
 if rank_mirrors /etc/pacman.d/mirrorlist system 8; then
 	sed 's/^/    /' /etc/pacman.d/mirrorlist
