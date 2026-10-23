@@ -112,9 +112,40 @@ else
 	warn "No mirror responded, keeping the original mirrorlist."
 fi
 
-info "Updating keyring and installing tools in the live environment..."
-pacman -Sy --noconfirm --needed artix-keyring >/dev/null
-pacman -S --noconfirm --needed btrfs-progs dosfstools gptfdisk >/dev/null
+# Clean pacman config with Artix repos only: live ISOs may ship Arch [extra]/[community]
+# (community no longer exists) which breaks syncing and causes package conflicts.
+# The live system is throwaway, so just replace its pacman.conf (backup kept).
+[[ -f /etc/pacman.conf.iso ]] || cp /etc/pacman.conf /etc/pacman.conf.iso
+cat >/etc/pacman.conf <<'EOF'
+[options]
+HoldPkg     = pacman glibc
+Architecture = auto
+ParallelDownloads = 5
+SigLevel    = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+[system]
+Include = /etc/pacman.d/mirrorlist
+
+[world]
+Include = /etc/pacman.d/mirrorlist
+
+[galaxy]
+Include = /etc/pacman.d/mirrorlist
+EOF
+
+info "Updating keyring and installing missing tools in the live environment..."
+pacman -Sy --noconfirm || die "Could not sync Artix repositories."
+pacman -S --noconfirm --needed artix-keyring ||
+	warn "Could not update artix-keyring, continuing with the ISO keyring."
+declare -a missing=()
+command -v mkfs.btrfs &>/dev/null || missing+=(btrfs-progs)
+command -v mkfs.fat &>/dev/null || missing+=(dosfstools)
+command -v sgdisk &>/dev/null || missing+=(gptfdisk)
+if ((${#missing[@]})); then
+	pacman -S --noconfirm --needed "${missing[@]}" ||
+		die "Could not install: ${missing[*]}"
+fi
 
 # ----------------------------------------------------------------------------
 # Find existing Windows boot loaders (any ESP on any disk)
