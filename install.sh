@@ -43,8 +43,18 @@ ask_pass() { # ask_pass VAR "prompt"
 	printf -v "$1" '%s' "$p1"
 }
 
-# Shared with the chroot stage: keeps the fastest reachable mirrors of a mirrorlist.
+# Shared with the chroot stage: pacman retry wrapper + mirror ranking.
 cat >/tmp/rank-mirrors.sh <<'RANK_EOF'
+pac() { # pacman with retries (flaky/mobile connections)
+	local i
+	for i in 1 2 3 4 5; do
+		pacman "$@" && return 0
+		echo "==> pacman failed (attempt $i/5), retrying in 5s..." >&2
+		sleep 5
+	done
+	return 1
+}
+
 rank_mirrors() { # rank_mirrors <mirrorlist> <repo to test> [count]
 	local list=$1 repo=$2 count=${3:-8} tmp out url test i=0
 	tmp=$(mktemp -d)
@@ -136,7 +146,8 @@ cat >/etc/pacman.conf <<'EOF'
 [options]
 HoldPkg     = pacman glibc
 Architecture = auto
-ParallelDownloads = 5
+ParallelDownloads = 3
+DisableDownloadTimeout
 SigLevel    = Required DatabaseOptional
 LocalFileSigLevel = Optional
 
@@ -151,15 +162,15 @@ Include = /etc/pacman.d/mirrorlist
 EOF
 
 info "Updating keyring and installing missing tools in the live environment..."
-pacman -Sy --noconfirm || die "Could not sync Artix repositories."
-pacman -S --noconfirm --needed artix-keyring ||
+pac -Sy --noconfirm || die "Could not sync Artix repositories."
+pac -S --noconfirm --needed artix-keyring ||
 	warn "Could not update artix-keyring, continuing with the ISO keyring."
 declare -a missing=()
 command -v mkfs.btrfs &>/dev/null || missing+=(btrfs-progs)
 command -v mkfs.fat &>/dev/null || missing+=(dosfstools)
 command -v sgdisk &>/dev/null || missing+=(gptfdisk)
 if ((${#missing[@]})); then
-	pacman -S --noconfirm --needed "${missing[@]}" ||
+	pac -S --noconfirm --needed "${missing[@]}" ||
 		die "Could not install: ${missing[*]}"
 fi
 # Make sure every tool actually runs before anything destructive happens
@@ -170,181 +181,195 @@ for t in sgdisk mkfs.btrfs mkfs.fat wipefs pacman; do
 	fi
 done
 
-# ----------------------------------------------------------------------------
-# Find existing Windows boot loaders (any ESP on any disk)
-# ----------------------------------------------------------------------------
-declare -a WIN_PARTS=() WIN_PARTUUIDS=()
-scan_windows() {
-	local dev tmp
-	tmp=$(mktemp -d)
-	while read -r dev; do
-		mount -o ro "$dev" "$tmp" 2>/dev/null || continue
-		if [[ -f "$tmp/EFI/Microsoft/Boot/bootmgfw.efi" ]]; then
-			WIN_PARTS+=("$dev")
-			WIN_PARTUUIDS+=("$(blkid -s PARTUUID -o value "$dev")")
-		fi
-		umount "$tmp"
-	done < <(lsblk -rpno NAME,PARTTYPE | awk -v g="$ESP_GUID" 'tolower($2)==g {print $1}')
-	rmdir "$tmp"
-}
-scan_windows
-if ((${#WIN_PARTS[@]})); then
-	info "Windows Boot Manager found on: ${WIN_PARTS[*]} — it will be added to the Limine menu."
-else
-	warn "Windows Boot Manager not found (only Artix will be in the menu)."
+RESUME=no
+if mountpoint -q "$MNT" && [[ -f "$MNT/root/install.env" ]]; then
+	warn "Found an unfinished installation in $MNT."
+	read -rp "Resume it (skip partitioning and basestrap)? [Y/n]: " c
+	[[ "$c" == [nN]* ]] || RESUME=yes
 fi
 
-# ----------------------------------------------------------------------------
-# User input
-# ----------------------------------------------------------------------------
-echo
-info "Available disks:"
-lsblk -dpno NAME,SIZE,MODEL | grep -Ev 'loop|sr[0-9]|zram' || true
-echo
-default_disk=$(lsblk -dpno NAME | grep -m1 nvme || true)
-ask DISK "Target disk" "$default_disk"
-[[ -b "$DISK" ]] || die "$DISK is not a block device."
+if [[ $RESUME == no ]]; then
+	# ----------------------------------------------------------------------------
+	# Find existing Windows boot loaders (any ESP on any disk)
+	# ----------------------------------------------------------------------------
+	declare -a WIN_PARTS=() WIN_PARTUUIDS=()
+	scan_windows() {
+		local dev tmp
+		tmp=$(mktemp -d)
+		while read -r dev; do
+			mount -o ro "$dev" "$tmp" 2>/dev/null || continue
+			if [[ -f "$tmp/EFI/Microsoft/Boot/bootmgfw.efi" ]]; then
+				WIN_PARTS+=("$dev")
+				WIN_PARTUUIDS+=("$(blkid -s PARTUUID -o value "$dev")")
+			fi
+			umount "$tmp"
+		done < <(lsblk -rpno NAME,PARTTYPE | awk -v g="$ESP_GUID" 'tolower($2)==g {print $1}')
+		rmdir "$tmp"
+	}
+	scan_windows
+	if ((${#WIN_PARTS[@]})); then
+		info "Windows Boot Manager found on: ${WIN_PARTS[*]} — it will be added to the Limine menu."
+	else
+		warn "Windows Boot Manager not found (only Artix will be in the menu)."
+	fi
 
-win_on_disk=no
-for p in "${WIN_PARTS[@]}"; do
-	[[ "/dev/$(lsblk -no PKNAME "$p")" == "$DISK" ]] && win_on_disk=yes
-done
+	# ----------------------------------------------------------------------------
+	# User input
+	# ----------------------------------------------------------------------------
+	echo
+	info "Available disks:"
+	lsblk -dpno NAME,SIZE,MODEL | grep -Ev 'loop|sr[0-9]|zram' || true
+	echo
+	default_disk=$(lsblk -dpno NAME | grep -m1 nvme || true)
+	ask DISK "Target disk" "$default_disk"
+	[[ -b "$DISK" ]] || die "$DISK is not a block device."
 
-echo
-echo "Partitioning mode for $DISK:"
-echo "  1) Wipe the WHOLE disk (ESP $ESP_SIZE + btrfs)"
-echo "  2) Install into UNALLOCATED free space (existing partitions are kept)"
-if [[ $win_on_disk == yes ]]; then
-	warn "Windows is on $DISK! Choose 2 (shrink a volume in Windows Disk Management first)."
-	ask MODE "Mode" "2"
-else
-	ask MODE "Mode" "1"
-fi
-[[ "$MODE" == 1 || "$MODE" == 2 ]] || die "Unknown mode: $MODE"
-
-ask HOSTNAME_ "Hostname" "artix"
-ask USERNAME "Username" "user"
-[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid username."
-ask_pass USER_PASS "Password for $USERNAME"
-ask_pass ROOT_PASS "Password for root"
-ask TIMEZONE "Timezone" "$TIMEZONE"
-[[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || die "Unknown timezone: $TIMEZONE"
-
-echo
-warn "Summary:"
-echo "  Disk:          $DISK (mode $MODE)"
-echo "  Host/user:     $HOSTNAME_ / $USERNAME"
-echo "  Timezone:      $TIMEZONE, locale $LANG_"
-echo "  Windows:       ${WIN_PARTS[*]:-none}"
-if [[ $MODE == 1 ]]; then
-	[[ $win_on_disk == yes ]] && warn "THIS WILL DELETE WINDOWS ON $DISK!"
-	read -rp "All data on $DISK will be destroyed. Type YES to continue: " c
-	[[ "$c" == YES ]] || die "Aborted."
-else
-	read -rp "Continue? [y/N]: " c
-	[[ "$c" == [yY]* ]] || die "Aborted."
-fi
-
-# ----------------------------------------------------------------------------
-# Partitioning
-# ----------------------------------------------------------------------------
-umount -R "$MNT" 2>/dev/null || true
-
-if [[ $MODE == 1 ]]; then
-	info "Partitioning $DISK..."
-	wipefs -af "$DISK"
-	sgdisk -Z "$DISK"
-	sgdisk -o "$DISK"
-fi
-
-# Start 0 = beginning of the largest free block, so in mode 2 existing partitions stay intact.
-before=$(lsblk -rpno NAME "$DISK" | sort)
-sgdisk -n "0:0:+$ESP_SIZE" -t 0:ef00 -c 0:ARTIX_ESP "$DISK"
-sgdisk -n "0:0:0"          -t 0:8300 -c 0:ARTIX_ROOT "$DISK"
-partprobe "$DISK" 2>/dev/null || true
-udevadm settle
-sleep 1
-
-# Only look at partitions that did not exist before (mode 2 may have old ARTIX_* labels)
-new_parts=$(comm -13 <(echo "$before") <(lsblk -rpno NAME "$DISK" | sort))
-ESP_PART="" ROOT_PART=""
-for p in $new_parts; do
-	case "$(lsblk -no PARTLABEL "$p")" in
-	ARTIX_ESP) ESP_PART=$p ;;
-	ARTIX_ROOT) ROOT_PART=$p ;;
-	esac
-done
-[[ -b "$ESP_PART" && -b "$ROOT_PART" ]] || die "Could not find the newly created partitions."
-
-# Windows that lived on a wiped disk is gone
-if [[ $MODE == 1 ]]; then
-	declare -a keep=()
-	for i in "${!WIN_PARTS[@]}"; do
-		[[ "/dev/$(lsblk -no PKNAME "${WIN_PARTS[$i]}" 2>/dev/null)" == "$DISK" ]] || keep+=("${WIN_PARTUUIDS[$i]}")
+	win_on_disk=no
+	for p in "${WIN_PARTS[@]}"; do
+		[[ "/dev/$(lsblk -no PKNAME "$p")" == "$DISK" ]] && win_on_disk=yes
 	done
-	WIN_PARTUUIDS=("${keep[@]}")
+
+	echo
+	echo "Partitioning mode for $DISK:"
+	echo "  1) Wipe the WHOLE disk (ESP $ESP_SIZE + btrfs)"
+	echo "  2) Install into UNALLOCATED free space (existing partitions are kept)"
+	if [[ $win_on_disk == yes ]]; then
+		warn "Windows is on $DISK! Choose 2 (shrink a volume in Windows Disk Management first)."
+		ask MODE "Mode" "2"
+	else
+		ask MODE "Mode" "1"
+	fi
+	[[ "$MODE" == 1 || "$MODE" == 2 ]] || die "Unknown mode: $MODE"
+
+	ask HOSTNAME_ "Hostname" "artix"
+	ask USERNAME "Username" "user"
+	[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid username."
+	ask_pass USER_PASS "Password for $USERNAME"
+	ask_pass ROOT_PASS "Password for root"
+	ask TIMEZONE "Timezone" "$TIMEZONE"
+	[[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || die "Unknown timezone: $TIMEZONE"
+
+	echo
+	warn "Summary:"
+	echo "  Disk:          $DISK (mode $MODE)"
+	echo "  Host/user:     $HOSTNAME_ / $USERNAME"
+	echo "  Timezone:      $TIMEZONE, locale $LANG_"
+	echo "  Windows:       ${WIN_PARTS[*]:-none}"
+	if [[ $MODE == 1 ]]; then
+		[[ $win_on_disk == yes ]] && warn "THIS WILL DELETE WINDOWS ON $DISK!"
+		read -rp "All data on $DISK will be destroyed. Type YES to continue: " c
+		[[ "$c" == YES ]] || die "Aborted."
+	else
+		read -rp "Continue? [y/N]: " c
+		[[ "$c" == [yY]* ]] || die "Aborted."
+	fi
+
+	# ----------------------------------------------------------------------------
+	# Partitioning
+	# ----------------------------------------------------------------------------
+	umount -R "$MNT" 2>/dev/null || true
+
+	if [[ $MODE == 1 ]]; then
+		info "Partitioning $DISK..."
+		wipefs -af "$DISK"
+		sgdisk -Z "$DISK"
+		sgdisk -o "$DISK"
+	fi
+
+	# Start 0 = beginning of the largest free block, so in mode 2 existing partitions stay intact.
+	before=$(lsblk -rpno NAME "$DISK" | sort)
+	sgdisk -n "0:0:+$ESP_SIZE" -t 0:ef00 -c 0:ARTIX_ESP "$DISK"
+	sgdisk -n "0:0:0"          -t 0:8300 -c 0:ARTIX_ROOT "$DISK"
+	partprobe "$DISK" 2>/dev/null || true
+	udevadm settle
+	sleep 1
+
+	# Only look at partitions that did not exist before (mode 2 may have old ARTIX_* labels)
+	new_parts=$(comm -13 <(echo "$before") <(lsblk -rpno NAME "$DISK" | sort))
+	ESP_PART="" ROOT_PART=""
+	for p in $new_parts; do
+		case "$(lsblk -no PARTLABEL "$p")" in
+		ARTIX_ESP) ESP_PART=$p ;;
+		ARTIX_ROOT) ROOT_PART=$p ;;
+		esac
+	done
+	[[ -b "$ESP_PART" && -b "$ROOT_PART" ]] || die "Could not find the newly created partitions."
+
+	# Windows that lived on a wiped disk is gone
+	if [[ $MODE == 1 ]]; then
+		declare -a keep=()
+		for i in "${!WIN_PARTS[@]}"; do
+			[[ "/dev/$(lsblk -no PKNAME "${WIN_PARTS[$i]}" 2>/dev/null)" == "$DISK" ]] || keep+=("${WIN_PARTUUIDS[$i]}")
+		done
+		WIN_PARTUUIDS=("${keep[@]}")
+	fi
+
+	info "ESP: $ESP_PART, root: $ROOT_PART"
+	mkfs.fat -F32 -n ARTIX_ESP "$ESP_PART"
+	mkfs.btrfs -f -L ARTIX "$ROOT_PART"
+
+	# ----------------------------------------------------------------------------
+	# Btrfs subvolumes
+	#   @ -> /    @home -> /home    @snapshots -> /.snapshots
+	#   @var_log, @var_cache, @var_tmp — excluded from root snapshots
+	# ----------------------------------------------------------------------------
+	info "Creating subvolumes..."
+	mount "$ROOT_PART" "$MNT"
+	for sv in @ @home @snapshots @var_log @var_cache @var_tmp; do
+		btrfs subvolume create "$MNT/$sv"
+	done
+	umount "$MNT"
+
+	mount -o "$BTRFS_OPTS,subvol=@" "$ROOT_PART" "$MNT"
+	mkdir -p "$MNT"/{boot,home,.snapshots,var/log,var/cache,var/tmp}
+	mount -o "$BTRFS_OPTS,subvol=@home"      "$ROOT_PART" "$MNT/home"
+	mount -o "$BTRFS_OPTS,subvol=@snapshots" "$ROOT_PART" "$MNT/.snapshots"
+	mount -o "$BTRFS_OPTS,subvol=@var_log"   "$ROOT_PART" "$MNT/var/log"
+	mount -o "$BTRFS_OPTS,subvol=@var_cache" "$ROOT_PART" "$MNT/var/cache"
+	mount -o "$BTRFS_OPTS,subvol=@var_tmp"   "$ROOT_PART" "$MNT/var/tmp"
+	mount -o fmask=0077,dmask=0077 "$ESP_PART" "$MNT/boot"
+
+	# ----------------------------------------------------------------------------
+	# Base system (basestrap copies the ranked mirrorlist into the target)
+	# ----------------------------------------------------------------------------
+	info "Installing base system (basestrap)..."
+	for attempt in 1 2 3; do
+		basestrap "$MNT" base base-devel runit elogind-runit \
+			linux linux-headers linux-firmware amd-ucode mkinitcpio \
+			btrfs-progs dosfstools efibootmgr \
+			networkmanager networkmanager-runit dbus-runit \
+			sudo git nano vim bash-completion && break
+		((attempt < 3)) || die "basestrap failed (network?). Rerun the script."
+		warn "basestrap failed (attempt $attempt/3), retrying in 5s..."
+		sleep 5
+	done
+
+	info "Generating fstab..."
+	fstabgen -U "$MNT" >>"$MNT/etc/fstab"
+	# subvolid pins would break snapshot restore/rollback, keep only subvol=
+	sed -i 's/subvolid=[0-9]*,\?//g; s/,\s/ /g' "$MNT/etc/fstab"
+
+	# ----------------------------------------------------------------------------
+	# Hand over to chroot
+	# ----------------------------------------------------------------------------
+	{
+		printf 'HOSTNAME_=%q\n'   "$HOSTNAME_"
+		printf 'USERNAME=%q\n'    "$USERNAME"
+		printf 'USER_PASS=%q\n'   "$USER_PASS"
+		printf 'ROOT_PASS=%q\n'   "$ROOT_PASS"
+		printf 'TIMEZONE=%q\n'    "$TIMEZONE"
+		printf 'LANG_=%q\n'       "$LANG_"
+		printf 'KEYMAP=%q\n'      "$KEYMAP"
+		printf 'CONSOLE_FONT=%q\n' "$CONSOLE_FONT"
+		printf 'ROOT_UUID=%q\n'   "$(blkid -s UUID -o value "$ROOT_PART")"
+		printf 'WIN_PARTUUIDS=(%s)\n' "${WIN_PARTUUIDS[*]:-}"
+		printf 'TTL_FIX=%q\n'     "$TTL_FIX"
+	} >"$MNT/root/install.env"
+	chmod 600 "$MNT/root/install.env"
 fi
-
-info "ESP: $ESP_PART, root: $ROOT_PART"
-mkfs.fat -F32 -n ARTIX_ESP "$ESP_PART"
-mkfs.btrfs -f -L ARTIX "$ROOT_PART"
-
-# ----------------------------------------------------------------------------
-# Btrfs subvolumes
-#   @ -> /    @home -> /home    @snapshots -> /.snapshots
-#   @var_log, @var_cache, @var_tmp — excluded from root snapshots
-# ----------------------------------------------------------------------------
-info "Creating subvolumes..."
-mount "$ROOT_PART" "$MNT"
-for sv in @ @home @snapshots @var_log @var_cache @var_tmp; do
-	btrfs subvolume create "$MNT/$sv"
-done
-umount "$MNT"
-
-mount -o "$BTRFS_OPTS,subvol=@" "$ROOT_PART" "$MNT"
-mkdir -p "$MNT"/{boot,home,.snapshots,var/log,var/cache,var/tmp}
-mount -o "$BTRFS_OPTS,subvol=@home"      "$ROOT_PART" "$MNT/home"
-mount -o "$BTRFS_OPTS,subvol=@snapshots" "$ROOT_PART" "$MNT/.snapshots"
-mount -o "$BTRFS_OPTS,subvol=@var_log"   "$ROOT_PART" "$MNT/var/log"
-mount -o "$BTRFS_OPTS,subvol=@var_cache" "$ROOT_PART" "$MNT/var/cache"
-mount -o "$BTRFS_OPTS,subvol=@var_tmp"   "$ROOT_PART" "$MNT/var/tmp"
-mount -o fmask=0077,dmask=0077 "$ESP_PART" "$MNT/boot"
-
-# ----------------------------------------------------------------------------
-# Base system (basestrap copies the ranked mirrorlist into the target)
-# ----------------------------------------------------------------------------
-info "Installing base system (basestrap)..."
-basestrap "$MNT" base base-devel runit elogind-runit \
-	linux linux-headers linux-firmware amd-ucode mkinitcpio \
-	btrfs-progs dosfstools efibootmgr \
-	networkmanager networkmanager-runit dbus-runit \
-	sudo git nano vim bash-completion
-
-info "Generating fstab..."
-fstabgen -U "$MNT" >>"$MNT/etc/fstab"
-# subvolid pins would break snapshot restore/rollback, keep only subvol=
-sed -i 's/subvolid=[0-9]*,\?//g; s/,\s/ /g' "$MNT/etc/fstab"
 
 cp /etc/pacman.d/mirrorlist "$MNT/etc/pacman.d/mirrorlist"
 cp -L /etc/resolv.conf "$MNT/etc/resolv.conf"
-
-# ----------------------------------------------------------------------------
-# Hand over to chroot
-# ----------------------------------------------------------------------------
-{
-	printf 'HOSTNAME_=%q\n'   "$HOSTNAME_"
-	printf 'USERNAME=%q\n'    "$USERNAME"
-	printf 'USER_PASS=%q\n'   "$USER_PASS"
-	printf 'ROOT_PASS=%q\n'   "$ROOT_PASS"
-	printf 'TIMEZONE=%q\n'    "$TIMEZONE"
-	printf 'LANG_=%q\n'       "$LANG_"
-	printf 'KEYMAP=%q\n'      "$KEYMAP"
-	printf 'CONSOLE_FONT=%q\n' "$CONSOLE_FONT"
-	printf 'ROOT_UUID=%q\n'   "$(blkid -s UUID -o value "$ROOT_PART")"
-	printf 'WIN_PARTUUIDS=(%s)\n' "${WIN_PARTUUIDS[*]:-}"
-	printf 'TTL_FIX=%q\n'     "$TTL_FIX"
-} >"$MNT/root/install.env"
-chmod 600 "$MNT/root/install.env"
 cp /tmp/rank-mirrors.sh "$MNT/root/rank-mirrors.sh"
 
 cat >"$MNT/root/chroot.sh" <<'CHROOT_EOF'
@@ -359,9 +384,10 @@ warn() { printf '%s==> WARNING:%s %s\n' "$c_ylw" "$c_rst" "$*"; }
 
 # --- pacman: Artix lib32 + Arch [extra]/[multilib] ---------------------------
 info "Configuring pacman (lib32, Arch extra/multilib)..."
-sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/; s/^#Color/Color/' /etc/pacman.conf
+sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 3/; s/^#Color/Color/' /etc/pacman.conf
+grep -q '^DisableDownloadTimeout' /etc/pacman.conf || sed -i '/^\[options\]/a DisableDownloadTimeout' /etc/pacman.conf
 sed -i '/^#\[lib32\]/{N;s/#//g}' /etc/pacman.conf
-pacman -Sy --noconfirm --needed artix-archlinux-support
+pac -Sy --noconfirm --needed artix-archlinux-support
 
 cat >/etc/pacman.d/mirrorlist-arch <<'EOF'
 Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
@@ -388,11 +414,11 @@ Include = /etc/pacman.d/mirrorlist-arch
 EOF
 fi
 pacman-key --populate archlinux
-pacman -Syu --noconfirm
+pac -Syu --noconfirm
 
 # --- packages ----------------------------------------------------------------
 info "Installing packages (NVIDIA, Hyprland, SDDM, snapper, limine)..."
-pacman -S --noconfirm --needed \
+pac -S --noconfirm --needed \
 	limine snapper inotify-tools rsync libnotify \
 	nvidia-open-dkms nvidia-utils lib32-nvidia-utils nvidia-settings egl-wayland libva-nvidia-driver \
 	hyprland xdg-desktop-portal-hyprland xdg-desktop-portal-gtk hyprpolkitagent \
@@ -420,7 +446,7 @@ cat >/etc/hosts <<EOF
 127.0.1.1   $HOSTNAME_.localdomain $HOSTNAME_
 EOF
 # Carrier tethering detection workaround, applied by runit at boot via sysctl.d
-if [[ $TTL_FIX == yes ]]; then
+if [[ ${TTL_FIX:-no} == yes ]]; then
 	echo 'net.ipv4.ip_default_ttl = 65' >/etc/sysctl.d/90-ttl.conf
 fi
 # limine-entry-tool / limine-snapper-sync identify the OS entry by machine-id
@@ -444,12 +470,14 @@ CMDLINE="root=UUID=$ROOT_UUID rootflags=subvol=@ rw quiet loglevel=3 nvidia_drm.
 
 # --- snapper -----------------------------------------------------------------
 info "snapper..."
-umount /.snapshots
-rmdir /.snapshots
-snapper --no-dbus -c root create-config /
-btrfs subvolume delete /.snapshots
-mkdir /.snapshots
-mount /.snapshots
+if [[ ! -f /etc/snapper/configs/root ]]; then
+	umount /.snapshots
+	rmdir /.snapshots
+	snapper --no-dbus -c root create-config /
+	btrfs subvolume delete /.snapshots
+	mkdir /.snapshots
+	mount /.snapshots
+fi
 chmod 750 /.snapshots
 chown :wheel /.snapshots
 sed -i \
@@ -670,7 +698,7 @@ done
 
 # --- snap-pac + first snapshot ---------------------------------------------------
 info "snap-pac and the first snapshot..."
-pacman -S --noconfirm --needed snap-pac || warn "snap-pac was not installed"
+pac -S --noconfirm --needed snap-pac || warn "snap-pac was not installed"
 snapper --no-dbus -c root create -d "Fresh install" -c important
 if command -v limine-snapper-sync &>/dev/null; then
 	limine-snapper-sync || warn "limine-snapper-sync failed"
