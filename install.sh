@@ -423,7 +423,15 @@ Include = /etc/pacman.d/mirrorlist-arch
 Include = /etc/pacman.d/mirrorlist-arch
 EOF
 fi
-pacman-key --populate archlinux
+# If the clock jumped after basestrap (RTC in local time for Windows), the local master key
+# is "created in the future" and gpg refuses to sign with it -> rebuild the keyring.
+if ! pacman-key --populate archlinux; then
+	warn "pacman keyring is broken (clock jump?), re-initializing it..."
+	gpgconf --homedir /etc/pacman.d/gnupg --kill all 2>/dev/null || true
+	rm -rf /etc/pacman.d/gnupg
+	pacman-key --init
+	pacman-key --populate artix archlinux
+fi
 pac -Syu --noconfirm
 
 # --- packages ----------------------------------------------------------------
