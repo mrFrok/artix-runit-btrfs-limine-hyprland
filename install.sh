@@ -120,6 +120,16 @@ if ! getent hosts artixlinux.org &>/dev/null; then
 	getent hosts artixlinux.org &>/dev/null || die "DNS still does not work."
 fi
 
+# A wrong clock (common with Windows dual boot) breaks gpg: "key was created in the future".
+# NTP may be missing/blocked on the ISO, so take the time from an HTTPS Date header.
+info "Syncing clock..."
+http_date=$(curl -sI -m 10 https://github.com | sed -n 's/^[Dd]ate: //p' | tr -d '\r')
+if [[ -n "$http_date" ]] && date -u -s "$http_date" >/dev/null; then
+	info "Clock set to $(date -u '+%F %T') UTC"
+else
+	warn "Could not sync the clock, current time: $(date -u '+%F %T') UTC"
+fi
+
 # Known-good mirrors as extra candidates, in case the ISO's mirrorlist is outdated
 if ! grep -q 'installer fallback' /etc/pacman.d/mirrorlist; then
 	cat >>/etc/pacman.d/mirrorlist <<'EOF'
