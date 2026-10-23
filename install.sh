@@ -731,6 +731,22 @@ info "Entering chroot..."
 artix-chroot "$MNT" /bin/bash /root/chroot.sh
 rm -f "$MNT/root/chroot.sh" "$MNT/root/install.env" "$MNT/root/rank-mirrors.sh"
 
+# efibootmgr inside the chroot may not see efivars, so make sure from the live system that
+# Limine is on the ESP (also as the removable fallback path) and registered in NVRAM.
+info "Checking UEFI boot entry..."
+mkdir -p "$MNT/boot/EFI/limine" "$MNT/boot/EFI/BOOT"
+[[ -f "$MNT/boot/EFI/limine/limine_x64.efi" ]] || cp "$MNT/usr/share/limine/BOOTX64.EFI" "$MNT/boot/EFI/limine/limine_x64.efi"
+[[ -f "$MNT/boot/EFI/BOOT/BOOTX64.EFI" ]] || cp "$MNT/usr/share/limine/BOOTX64.EFI" "$MNT/boot/EFI/BOOT/BOOTX64.EFI"
+if ! efibootmgr 2>/dev/null | grep -qi 'limine'; then
+	esp_dev=$(findmnt -no SOURCE "$MNT/boot")
+	esp_disk="/dev/$(lsblk -no PKNAME "$esp_dev")"
+	esp_num=$(cat "/sys/class/block/$(basename "$esp_dev")/partition")
+	efibootmgr --create --disk "$esp_disk" --part "$esp_num" --label "Limine" \
+		--loader '\EFI\limine\limine_x64.efi' ||
+		warn "Could not create the UEFI entry; pick the NVMe drive (fallback BOOTX64.EFI) in the firmware boot menu."
+fi
+efibootmgr 2>/dev/null | grep -iE 'BootOrder|limine' || true
+
 echo
 info "Installation complete!"
 echo "  Check the boot menu: cat $MNT/boot/limine.conf"
