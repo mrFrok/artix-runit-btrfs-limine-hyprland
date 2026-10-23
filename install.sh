@@ -17,6 +17,7 @@ CONSOLE_FONT="${CONSOLE_FONT:-cyr-sun16}"
 ESP_SIZE="${ESP_SIZE:-2G}"
 BTRFS_OPTS="noatime,compress=zstd:1"
 MNT=/mnt
+TTL_FIX=no
 
 ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 
@@ -81,8 +82,21 @@ source /tmp/rank-mirrors.sh
 command -v basestrap >/dev/null || die "basestrap not found — is this the Artix live ISO?"
 
 info "Checking network..."
-if ! ping -c1 -W3 1.1.1.1 &>/dev/null && ! ping -c1 -W3 8.8.8.8 &>/dev/null; then
-	die "No network. Check 'ip a'; cable: 'dhcpcd', Wi-Fi: 'connmanctl' or 'nmtui'. Then rerun."
+net_ok() { # ICMP may be filtered, so also try plain HTTP to an IP
+	ping -c1 -W3 1.1.1.1 &>/dev/null || ping -c1 -W3 8.8.8.8 &>/dev/null ||
+		curl -so /dev/null -m 5 http://1.1.1.1 || curl -so /dev/null -m 5 http://8.8.8.8
+}
+if ! net_ok; then
+	gw=$(ip route show default | awk '{print $3; exit}')
+	if [[ -n "$gw" ]] && ping -c1 -W3 "$gw" &>/dev/null; then
+		warn "Gateway $gw is reachable, but the internet is not."
+		warn "Phone USB/Wi-Fi tethering? Mobile carriers often block it by TTL — trying TTL=65..."
+		sysctl -qw net.ipv4.ip_default_ttl=65
+		net_ok || die "Still no internet via $gw. Check mobile data / tethering limits on the phone."
+		TTL_FIX=yes
+	else
+		die "No network. Check 'ip a' / 'ip route'; cable: 'dhcpcd', Wi-Fi: 'connmanctl'. Then rerun."
+	fi
 fi
 if ! getent hosts artixlinux.org &>/dev/null; then
 	warn "DNS is not working, switching to 1.1.1.1 / 8.8.8.8"
@@ -274,6 +288,7 @@ cp -L /etc/resolv.conf "$MNT/etc/resolv.conf"
 	printf 'CONSOLE_FONT=%q\n' "$CONSOLE_FONT"
 	printf 'ROOT_UUID=%q\n'   "$(blkid -s UUID -o value "$ROOT_PART")"
 	printf 'WIN_PARTUUIDS=(%s)\n' "${WIN_PARTUUIDS[*]:-}"
+	printf 'TTL_FIX=%q\n'     "$TTL_FIX"
 } >"$MNT/root/install.env"
 chmod 600 "$MNT/root/install.env"
 cp /tmp/rank-mirrors.sh "$MNT/root/rank-mirrors.sh"
@@ -350,6 +365,10 @@ cat >/etc/hosts <<EOF
 ::1         localhost
 127.0.1.1   $HOSTNAME_.localdomain $HOSTNAME_
 EOF
+# Carrier tethering detection workaround, applied by runit at boot via sysctl.d
+if [[ $TTL_FIX == yes ]]; then
+	echo 'net.ipv4.ip_default_ttl = 65' >/etc/sysctl.d/90-ttl.conf
+fi
 # limine-entry-tool / limine-snapper-sync identify the OS entry by machine-id
 [[ -s /etc/machine-id ]] || dbus-uuidgen --ensure=/etc/machine-id
 
