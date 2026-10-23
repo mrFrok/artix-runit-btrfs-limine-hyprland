@@ -8,7 +8,7 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------------
-# Defaults (can be overridden via environment: HOSTNAME_=... bash install.sh)
+# Defaults (can be overridden via environment: TIMEZONE=... bash install.sh)
 # ----------------------------------------------------------------------------
 TIMEZONE="${TIMEZONE:-Europe/Moscow}"
 LANG_="${LANG_:-ru_RU.UTF-8}"
@@ -35,26 +35,70 @@ ask_pass() { # ask_pass VAR "prompt"
 	local p1 p2
 	while true; do
 		read -rsp "$2: " p1; echo
-		read -rsp "Повторите: " p2; echo
+		read -rsp "Repeat: " p2; echo
 		[[ -n "$p1" && "$p1" == "$p2" ]] && break
-		warn "Пароли пустые или не совпадают, ещё раз."
+		warn "Passwords are empty or do not match, try again."
 	done
 	printf -v "$1" '%s' "$p1"
 }
 
-part_path() { # part_path /dev/nvme0n1 2 -> /dev/nvme0n1p2
-	if [[ "$1" =~ [0-9]$ ]]; then echo "${1}p$2"; else echo "${1}$2"; fi
+# Shared with the chroot stage: keeps the fastest reachable mirrors of a mirrorlist.
+cat >/tmp/rank-mirrors.sh <<'RANK_EOF'
+rank_mirrors() { # rank_mirrors <mirrorlist> <repo to test> [count]
+	local list=$1 repo=$2 count=${3:-8} tmp out url test i=0
+	tmp=$(mktemp -d)
+	out=$(mktemp)
+	while read -r url; do
+		test=${url//\$repo/$repo}
+		test=${test//\$arch/x86_64}
+		(
+			t=$(curl -sfo /dev/null --connect-timeout 3 -m 10 -w '%{time_total}' "$test/$repo.db") &&
+				echo "$t $url" >"$tmp/$i"
+		) &
+		i=$((i + 1))
+		if ((i % 20 == 0)); then wait; fi
+	done < <(sed -n 's/^[#[:space:]]*Server[[:space:]]*=[[:space:]]*//p' "$list" | sort -u)
+	wait
+	cat "$tmp"/* 2>/dev/null | sort -n | head -n "$count" | awk '{print "Server = " $2}' >"$out" || true
+	rm -rf "$tmp"
+	if [[ -s "$out" ]]; then
+		cp "$list" "$list.bak"
+		cat "$out" >"$list"
+		rm -f "$out"
+		return 0
+	fi
+	rm -f "$out"
+	return 1
 }
+RANK_EOF
+source /tmp/rank-mirrors.sh
 
 # ----------------------------------------------------------------------------
 # Pre-flight checks
 # ----------------------------------------------------------------------------
-((EUID == 0)) || die "Запустите от root."
-[[ -d /sys/firmware/efi/efivars ]] || die "Система загружена не в режиме UEFI."
-command -v basestrap >/dev/null || die "basestrap не найден — это точно Artix live ISO?"
-ping -c1 -W3 artixlinux.org &>/dev/null || die "Нет интернета. Подключитесь (ethernet / nmtui / connmanctl) и повторите."
+((EUID == 0)) || die "Run as root."
+[[ -d /sys/firmware/efi/efivars ]] || die "Not booted in UEFI mode."
+command -v basestrap >/dev/null || die "basestrap not found — is this the Artix live ISO?"
 
-info "Обновляю ключи и ставлю утилиты в live-окружение..."
+info "Checking network..."
+if ! ping -c1 -W3 1.1.1.1 &>/dev/null && ! ping -c1 -W3 8.8.8.8 &>/dev/null; then
+	die "No network. Check 'ip a'; cable: 'dhcpcd', Wi-Fi: 'connmanctl' or 'nmtui'. Then rerun."
+fi
+if ! getent hosts artixlinux.org &>/dev/null; then
+	warn "DNS is not working, switching to 1.1.1.1 / 8.8.8.8"
+	rm -f /etc/resolv.conf
+	printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf
+	getent hosts artixlinux.org &>/dev/null || die "DNS still does not work."
+fi
+
+info "Ranking Artix mirrors (this takes a few seconds)..."
+if rank_mirrors /etc/pacman.d/mirrorlist system 8; then
+	sed 's/^/    /' /etc/pacman.d/mirrorlist
+else
+	warn "No mirror responded, keeping the original mirrorlist."
+fi
+
+info "Updating keyring and installing tools in the live environment..."
 pacman -Sy --noconfirm --needed artix-keyring >/dev/null
 pacman -S --noconfirm --needed btrfs-progs dosfstools gptfdisk >/dev/null
 
@@ -77,21 +121,21 @@ scan_windows() {
 }
 scan_windows
 if ((${#WIN_PARTS[@]})); then
-	info "Найден загрузчик Windows: ${WIN_PARTS[*]} — он будет добавлен в меню Limine."
+	info "Windows Boot Manager found on: ${WIN_PARTS[*]} — it will be added to the Limine menu."
 else
-	warn "Загрузчик Windows не найден (будет установлен только Artix)."
+	warn "Windows Boot Manager not found (only Artix will be in the menu)."
 fi
 
 # ----------------------------------------------------------------------------
 # User input
 # ----------------------------------------------------------------------------
 echo
-info "Доступные диски:"
+info "Available disks:"
 lsblk -dpno NAME,SIZE,MODEL | grep -Ev 'loop|sr[0-9]|zram' || true
 echo
 default_disk=$(lsblk -dpno NAME | grep -m1 nvme || true)
-ask DISK "Диск для установки" "$default_disk"
-[[ -b "$DISK" ]] || die "$DISK не является блочным устройством."
+ask DISK "Target disk" "$default_disk"
+[[ -b "$DISK" ]] || die "$DISK is not a block device."
 
 win_on_disk=no
 for p in "${WIN_PARTS[@]}"; do
@@ -99,38 +143,38 @@ for p in "${WIN_PARTS[@]}"; do
 done
 
 echo
-echo "Режим разметки $DISK:"
-echo "  1) Стереть ВЕСЬ диск (ESP $ESP_SIZE + btrfs)"
-echo "  2) Установить в НЕРАЗМЕЧЕННОЕ свободное место (существующие разделы не трогаются)"
+echo "Partitioning mode for $DISK:"
+echo "  1) Wipe the WHOLE disk (ESP $ESP_SIZE + btrfs)"
+echo "  2) Install into UNALLOCATED free space (existing partitions are kept)"
 if [[ $win_on_disk == yes ]]; then
-	warn "На $DISK находится Windows! Выбирайте 2 (заранее освободите место в «Управлении дисками» Windows)."
-	ask MODE "Режим" "2"
+	warn "Windows is on $DISK! Choose 2 (shrink a volume in Windows Disk Management first)."
+	ask MODE "Mode" "2"
 else
-	ask MODE "Режим" "1"
+	ask MODE "Mode" "1"
 fi
-[[ "$MODE" == 1 || "$MODE" == 2 ]] || die "Неизвестный режим: $MODE"
+[[ "$MODE" == 1 || "$MODE" == 2 ]] || die "Unknown mode: $MODE"
 
-ask HOSTNAME_ "Имя компьютера" "artix"
-ask USERNAME "Имя пользователя" "user"
-[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Недопустимое имя пользователя."
-ask_pass USER_PASS "Пароль для $USERNAME"
-ask_pass ROOT_PASS "Пароль для root"
-ask TIMEZONE "Часовой пояс" "$TIMEZONE"
-[[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || die "Нет такого часового пояса: $TIMEZONE"
+ask HOSTNAME_ "Hostname" "artix"
+ask USERNAME "Username" "user"
+[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid username."
+ask_pass USER_PASS "Password for $USERNAME"
+ask_pass ROOT_PASS "Password for root"
+ask TIMEZONE "Timezone" "$TIMEZONE"
+[[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || die "Unknown timezone: $TIMEZONE"
 
 echo
-warn "Итог:"
-echo "  Диск:          $DISK (режим $MODE)"
-echo "  Хост/юзер:     $HOSTNAME_ / $USERNAME"
-echo "  Часовой пояс:  $TIMEZONE, язык $LANG_"
-echo "  Windows:       ${WIN_PARTS[*]:-нет}"
+warn "Summary:"
+echo "  Disk:          $DISK (mode $MODE)"
+echo "  Host/user:     $HOSTNAME_ / $USERNAME"
+echo "  Timezone:      $TIMEZONE, locale $LANG_"
+echo "  Windows:       ${WIN_PARTS[*]:-none}"
 if [[ $MODE == 1 ]]; then
-	[[ $win_on_disk == yes ]] && warn "ЭТО УДАЛИТ WINDOWS НА $DISK!"
-	read -rp "Все данные на $DISK будут уничтожены. Введите YES для продолжения: " c
-	[[ "$c" == YES ]] || die "Отменено."
+	[[ $win_on_disk == yes ]] && warn "THIS WILL DELETE WINDOWS ON $DISK!"
+	read -rp "All data on $DISK will be destroyed. Type YES to continue: " c
+	[[ "$c" == YES ]] || die "Aborted."
 else
-	read -rp "Продолжить? [y/N]: " c
-	[[ "$c" == [yY]* ]] || die "Отменено."
+	read -rp "Continue? [y/N]: " c
+	[[ "$c" == [yY]* ]] || die "Aborted."
 fi
 
 # ----------------------------------------------------------------------------
@@ -139,7 +183,7 @@ fi
 umount -R "$MNT" 2>/dev/null || true
 
 if [[ $MODE == 1 ]]; then
-	info "Размечаю $DISK..."
+	info "Partitioning $DISK..."
 	wipefs -af "$DISK"
 	sgdisk -Z "$DISK"
 	sgdisk -o "$DISK"
@@ -162,7 +206,7 @@ for p in $new_parts; do
 	ARTIX_ROOT) ROOT_PART=$p ;;
 	esac
 done
-[[ -b "$ESP_PART" && -b "$ROOT_PART" ]] || die "Не удалось найти созданные разделы."
+[[ -b "$ESP_PART" && -b "$ROOT_PART" ]] || die "Could not find the newly created partitions."
 
 # Windows that lived on a wiped disk is gone
 if [[ $MODE == 1 ]]; then
@@ -182,7 +226,7 @@ mkfs.btrfs -f -L ARTIX "$ROOT_PART"
 #   @ -> /    @home -> /home    @snapshots -> /.snapshots
 #   @var_log, @var_cache, @var_tmp — excluded from root snapshots
 # ----------------------------------------------------------------------------
-info "Создаю subvolumes..."
+info "Creating subvolumes..."
 mount "$ROOT_PART" "$MNT"
 for sv in @ @home @snapshots @var_log @var_cache @var_tmp; do
 	btrfs subvolume create "$MNT/$sv"
@@ -199,19 +243,22 @@ mount -o "$BTRFS_OPTS,subvol=@var_tmp"   "$ROOT_PART" "$MNT/var/tmp"
 mount -o fmask=0077,dmask=0077 "$ESP_PART" "$MNT/boot"
 
 # ----------------------------------------------------------------------------
-# Base system
+# Base system (basestrap copies the ranked mirrorlist into the target)
 # ----------------------------------------------------------------------------
-info "Устанавливаю базовую систему (basestrap)..."
+info "Installing base system (basestrap)..."
 basestrap "$MNT" base base-devel runit elogind-runit \
 	linux linux-headers linux-firmware amd-ucode mkinitcpio \
 	btrfs-progs dosfstools efibootmgr \
 	networkmanager networkmanager-runit dbus-runit \
 	sudo git nano vim bash-completion
 
-info "Генерирую fstab..."
+info "Generating fstab..."
 fstabgen -U "$MNT" >>"$MNT/etc/fstab"
 # subvolid pins would break snapshot restore/rollback, keep only subvol=
 sed -i 's/subvolid=[0-9]*,\?//g; s/,\s/ /g' "$MNT/etc/fstab"
+
+cp /etc/pacman.d/mirrorlist "$MNT/etc/pacman.d/mirrorlist"
+cp -L /etc/resolv.conf "$MNT/etc/resolv.conf"
 
 # ----------------------------------------------------------------------------
 # Hand over to chroot
@@ -229,29 +276,37 @@ sed -i 's/subvolid=[0-9]*,\?//g; s/,\s/ /g' "$MNT/etc/fstab"
 	printf 'WIN_PARTUUIDS=(%s)\n' "${WIN_PARTUUIDS[*]:-}"
 } >"$MNT/root/install.env"
 chmod 600 "$MNT/root/install.env"
+cp /tmp/rank-mirrors.sh "$MNT/root/rank-mirrors.sh"
 
 cat >"$MNT/root/chroot.sh" <<'CHROOT_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /root/install.env
+source /root/rank-mirrors.sh
 
 c_grn=$'\e[1;32m'; c_ylw=$'\e[1;33m'; c_rst=$'\e[0m'
 info() { printf '%s==>%s %s\n' "$c_grn" "$c_rst" "$*"; }
 warn() { printf '%s==> WARNING:%s %s\n' "$c_ylw" "$c_rst" "$*"; }
 
 # --- pacman: Artix lib32 + Arch [extra]/[multilib] ---------------------------
-info "Настраиваю pacman (lib32, Arch extra/multilib)..."
+info "Configuring pacman (lib32, Arch extra/multilib)..."
 sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/; s/^#Color/Color/' /etc/pacman.conf
 sed -i '/^#\[lib32\]/{N;s/#//g}' /etc/pacman.conf
 pacman -Sy --noconfirm --needed artix-archlinux-support
 
-if ! grep -q '^Server' /etc/pacman.d/mirrorlist-arch 2>/dev/null; then
-	cat >/etc/pacman.d/mirrorlist-arch <<'EOF'
+cat >/etc/pacman.d/mirrorlist-arch <<'EOF'
 Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
 Server = https://mirror.yandex.ru/archlinux/$repo/os/$arch
+Server = https://mirror.truenetwork.ru/archlinux/$repo/os/$arch
+Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
 Server = https://mirror.rackspace.com/archlinux/$repo/os/$arch
+Server = https://ftp.fau.de/archlinux/$repo/os/$arch
+Server = https://mirror.netcologne.de/archlinux/$repo/os/$arch
+Server = https://mirrors.dotsrc.org/archlinux/$repo/os/$arch
 EOF
-fi
+info "Ranking Arch mirrors..."
+rank_mirrors /etc/pacman.d/mirrorlist-arch core 5 || warn "Arch mirror ranking failed, using the default list."
+
 if ! grep -q '^\[extra\]' /etc/pacman.conf; then
 	cat >>/etc/pacman.conf <<'EOF'
 
@@ -267,7 +322,7 @@ pacman-key --populate archlinux
 pacman -Syu --noconfirm
 
 # --- packages ----------------------------------------------------------------
-info "Устанавливаю пакеты (NVIDIA, Hyprland, SDDM, snapper, limine)..."
+info "Installing packages (NVIDIA, Hyprland, SDDM, snapper, limine)..."
 pacman -S --noconfirm --needed \
 	limine snapper inotify-tools rsync libnotify \
 	nvidia-open-dkms nvidia-utils lib32-nvidia-utils nvidia-settings egl-wayland libva-nvidia-driver \
@@ -279,7 +334,7 @@ pacman -S --noconfirm --needed \
 	cronie cronie-runit
 
 # --- locale / time / host ----------------------------------------------------
-info "Локаль, время, hostname..."
+info "Locale, time, hostname..."
 ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 hwclock --systohc
 sed -i 's/^#\(en_US.UTF-8 UTF-8\)/\1/; s/^#\(ru_RU.UTF-8 UTF-8\)/\1/' /etc/locale.gen
@@ -299,7 +354,7 @@ EOF
 [[ -s /etc/machine-id ]] || dbus-uuidgen --ensure=/etc/machine-id
 
 # --- users -------------------------------------------------------------------
-info "Пользователи..."
+info "Users..."
 echo "root:$ROOT_PASS" | chpasswd
 id "$USERNAME" &>/dev/null || useradd -m -G wheel,video,audio,input,storage -s /bin/bash "$USERNAME"
 echo "$USERNAME:$USER_PASS" | chpasswd
@@ -356,7 +411,7 @@ EOF
 chmod 755 /etc/cron.hourly/snapper-timeline /etc/cron.daily/snapper-cleanup
 
 # --- limine config (shared by limine-entry-tool and limine-snapper-sync) ------
-info "Конфиг limine..."
+info "Limine config..."
 cat >/etc/default/limine <<EOF
 ESP_PATH="/boot"
 TARGET_OS_NAME="Artix Linux"
@@ -376,7 +431,7 @@ EOF
 [[ -f /boot/limine.conf ]] || printf 'timeout: 5\n' >/boot/limine.conf
 
 # --- AUR: limine-mkinitcpio-hook, limine-snapper-sync, yay-bin ---------------
-info "Собираю AUR-пакеты (GraalVM native-image — это займёт несколько минут)..."
+info "Building AUR packages (GraalVM native-image — this takes a few minutes)..."
 echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/99-installer
 chmod 440 /etc/sudoers.d/99-installer
 BUILD_DIR="/home/$USERNAME/.cache/aur-build"
@@ -390,7 +445,7 @@ for pkg in limine-mkinitcpio-hook limine-snapper-sync yay-bin; do
 		cd '$pkg'
 		makepkg -si --noconfirm --needed
 	"; then
-		warn "Не удалось собрать $pkg"
+		warn "Failed to build $pkg"
 		[[ $pkg == yay-bin ]] || aur_ok=no
 	fi
 done
@@ -417,15 +472,15 @@ EOF
 }
 
 if [[ $aur_ok == yes ]]; then
-	info "Limine: установка + генерация пунктов меню (limine-entry-tool)..."
+	info "Limine: install + generate menu entries (limine-entry-tool)..."
 	sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect microcode modconf keyboard keymap consolefont block filesystems btrfs-overlayfs fsck)/' /etc/mkinitcpio.conf
-	limine-install --fallback || warn "limine-install завершился с ошибкой"
-	limine-update || warn "limine-update завершился с ошибкой"
+	limine-install --fallback || warn "limine-install failed"
+	limine-update || warn "limine-update failed"
 fi
 
 # Fallback: manual Limine setup if the AUR tooling failed
 if ! grep -q 'protocol: linux' /boot/limine.conf; then
-	warn "Пишу limine.conf вручную (без меню снэпшотов)."
+	warn "Writing limine.conf manually (no snapshot menu)."
 	mkinitcpio -P
 	mkdir -p /boot/EFI/BOOT /boot/EFI/limine
 	cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/BOOTX64.EFI
@@ -434,7 +489,7 @@ if ! grep -q 'protocol: linux' /boot/limine.conf; then
 	esp_disk="/dev/$(lsblk -no PKNAME "$esp_dev")"
 	esp_num=$(cat "/sys/class/block/$(basename "$esp_dev")/partition")
 	efibootmgr --create --disk "$esp_disk" --part "$esp_num" \
-		--label "Limine" --loader '\EFI\limine\limine_x64.efi' || warn "efibootmgr не смог создать запись"
+		--label "Limine" --loader '\EFI\limine\limine_x64.efi' || warn "efibootmgr could not create a boot entry"
 	cat >/boot/limine.conf <<EOF
 timeout: 5
 
@@ -466,10 +521,10 @@ while read -r dev; do
 	if [[ -f "$tmp/EFI/Microsoft/Boot/bootmgfw.efi" ]]; then
 		id=$(blkid -s PARTUUID -o value "$dev")
 		if grep -qi "uuid($id)" /boot/limine.conf; then
-			echo "Windows на $dev уже в limine.conf"
+			echo "Windows on $dev is already in limine.conf"
 		else
 			printf '\n/Windows\n    comment: Windows Boot Manager\n    protocol: efi\n    path: uuid(%s):/EFI/Microsoft/Boot/bootmgfw.efi\n' "$id" >>/boot/limine.conf
-			echo "Добавлено: Windows ($dev)"
+			echo "Added: Windows ($dev)"
 		fi
 	fi
 	umount "$tmp"
@@ -519,7 +574,7 @@ env = ELECTRON_OZONE_PLATFORM_HINT,auto
 # Audio (no systemd user services on runit)
 $pw_line
 
-# Polkit agent, portals, bar
+# Polkit agent, bar
 exec-once = /usr/lib/hyprpolkitagent/hyprpolkitagent
 exec-once = waybar
 
@@ -531,34 +586,34 @@ fi
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.config"
 
 # --- runit services --------------------------------------------------------------
-info "Включаю сервисы runit..."
+info "Enabling runit services..."
 for s in dbus elogind NetworkManager sddm cronie; do
 	if [[ -d /etc/runit/sv/$s ]]; then
 		ln -sf "/etc/runit/sv/$s" /etc/runit/runsvdir/default/
 	else
-		warn "runit-сервис $s не найден"
+		warn "runit service $s not found"
 	fi
 done
 
 # --- snap-pac + first snapshot ---------------------------------------------------
-info "snap-pac и первый снэпшот..."
-pacman -S --noconfirm --needed snap-pac || warn "snap-pac не установлен"
+info "snap-pac and the first snapshot..."
+pacman -S --noconfirm --needed snap-pac || warn "snap-pac was not installed"
 snapper --no-dbus -c root create -d "Fresh install" -c important
 if command -v limine-snapper-sync &>/dev/null; then
-	limine-snapper-sync || warn "limine-snapper-sync завершился с ошибкой"
+	limine-snapper-sync || warn "limine-snapper-sync failed"
 fi
 
-rm -f /root/install.env
-info "Готово внутри chroot."
+rm -f /root/install.env /root/rank-mirrors.sh
+info "Done inside chroot."
 CHROOT_EOF
 chmod 700 "$MNT/root/chroot.sh"
 
-info "Вхожу в chroot..."
+info "Entering chroot..."
 artix-chroot "$MNT" /bin/bash /root/chroot.sh
-rm -f "$MNT/root/chroot.sh" "$MNT/root/install.env"
+rm -f "$MNT/root/chroot.sh" "$MNT/root/install.env" "$MNT/root/rank-mirrors.sh"
 
 echo
-info "Установка завершена!"
-echo "  Проверьте меню: cat $MNT/boot/limine.conf"
-echo "  Затем: umount -R $MNT && reboot"
-echo "  В SDDM выберите сессию «Hyprland (Artix)»."
+info "Installation complete!"
+echo "  Check the boot menu: cat $MNT/boot/limine.conf"
+echo "  Then: umount -R $MNT && reboot"
+echo "  In SDDM pick the \"Hyprland (Artix)\" session."
